@@ -115,7 +115,7 @@
   .cal-nav-btn:hover{background:var(--surface-alt);color:var(--text-primary);}
 
   .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:1fr;gap:4px;flex:1;min-height:0;}
-  .cal-day-hdr{text-align:center;font-size:9px;font-weight:700;color:var(--text-muted);padding:1px 0 6px;text-transform:uppercase;letter-spacing:.05em;}
+  .cal-day-hdr{text-align:center;font-size:9px;font-weight:700;color:var(--text-muted);padding:1px 0 2px;text-transform:uppercase;letter-spacing:.05em;}
   .cal-day{border-radius:7px;border:1px solid var(--border);display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;transition:all .12s;font-weight:500;color:var(--text-primary);background:var(--surface);gap:2px;min-height:0;overflow:hidden;position:relative;}
   .cal-day:hover:not(.empty):not(.inactive){border-color:var(--accent);background:var(--accent-light);}
   .cal-day.empty{cursor:default;background:transparent;border-color:transparent;}
@@ -566,14 +566,12 @@ const COLLABS_STATIC = [
   {"name":"Yassine MAHFOUDH","_pageUrl":"https://app.notion.com/p/3a460816c7058075bbdcda6921ce93a7"}
 ];
 
-const DS = "3d389ed9-48ee-4ec4-a6f7-3fb5fecc7c7b";
-const NOTION = "Notion";
+const DS = "3d389ed9-48ee-4ec4-a6f7-3fb5fecc7c7b"; // gardé pour référence
 const MONTHS = ["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"];
 const DAYS = ["Lu","Ma","Me","Je","Ve","Sa","Di"];
 const CLOSE_DAY = 20;
 
 // ── ÉTAT GLOBAL ──
-let mcp            = null;
 let collabs        = [];
 let selectedCollab = null;
 let isClosed       = false;
@@ -596,6 +594,20 @@ let pqDateFrom  = null;
 let pqDateTo    = null;
 let pqFirstClick = null;
 let pqEditingIdx = null; // index dans basket.pq en cours d'édition (null = nouvelle saisie)
+
+// ── API NOTION (via proxy serverless) ──
+async function notionAPI(action, payload) {
+  const res = await fetch("/api/notion", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, payload })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || "Erreur API");
+  }
+  return res.json();
+}
 
 // ── INIT ──
 async function init() {
@@ -626,11 +638,7 @@ async function init() {
     }
   } catch {}
 
-  // Sinon laisser la modale ouverte et charger mcp
-  try {
-    mcp = await claude.use("mcp");
-    if (!mcp) showToast("Connexion Notion indisponible.", "error");
-  } catch(e) { showToast("Erreur connexion.", "error"); }
+  // Sinon laisser la modale ouverte — pas besoin d'initialiser mcp
 }
 
 // ── IDENTITÉ ──
@@ -654,9 +662,6 @@ function confirmIdentity(silent = false) {
 
   // Toujours s'assurer que mcp est chargé avant de charger les données
   (async () => {
-    if (!mcp) {
-      try { mcp = await claude.use("mcp"); } catch(e) { showToast("Connexion Notion indisponible.", "error"); return; }
-    }
     Promise.all([loadEntries_("hs"), loadEntries_("pq")]);
   })();
 }
@@ -789,49 +794,51 @@ function renderCal(type) {
 
 // ── CHARGEMENT ──
 async function loadEntries_(type) {
-  if (!mcp || !selectedCollab) return;
+  if (!selectedCollab) return;
   const s = calState[type];
   const key = cacheKey(type, s.year, s.month);
   s.loading = true; renderCal(type);
+
   const moisNom  = MONTHS[s.month];
   const typeName = type === "hs" ? "Heures supplémentaires" : "Piquet";
+  const collabId = formatUUID(selectedCollab._pageUrl.split("/").pop().replace(/-/g, ""));
 
   try {
-    const res = await mcp.callTool(NOTION, "notion-query-data-sources", {
-      data: {
-        mode: "rows",
-        data_source_url: `collection://${DS}`,
-        filter: {
-          type: "group", operator: "and",
-          filters: [
-            { type:"property", property:"Collaborateur", propertyType:"relation", operator:"relation_contains", value:{type:"exact",value:selectedCollab._pageUrl} },
-            { type:"property", property:"Type",           propertyType:"select", operator:"enum_is",        value:{type:"exact",value:typeName} },
-            { type:"property", property:"Mois",           propertyType:"select", operator:"enum_is",        value:{type:"exact",value:moisNom} },
-            { type:"property", property:"Année",          propertyType:"number", operator:"number_equals",  value:{type:"exact",value:s.year} }
-          ]
-        },
-        limit: 100
-      }
+    const data = await notionAPI("query", {
+      filter: {
+        and: [
+          { property: "Collaborateur", relation: { contains: collabId } },
+          { property: "Type", select: { equals: typeName } },
+          { property: "Mois", select: { equals: moisNom } },
+          { property: "Année", number: { equals: s.year } }
+        ]
+      },
+      limit: 100
     });
 
-    const rows = extractRows(res);
-    s.entries  = {};
+    const rows = data.results || [];
+    s.entries = {};
     if (type === "hs") {
       rows.forEach(r => {
-        const date = r["date:Date:start"] || "";
-        if (date) s.entries[date] = { hours: r["Nb heures sup"]||0, comment: r["Détails appels / Motif"]||"", isNight: r["Nuit"]==="__YES__"||r["Nuit"]===true, pageUrl: r.url||"" };
+        const date = r["date:Date:start"];
+        if (date) s.entries[date] = { hours: r["Nb heures sup"] || 0, comment: r["Détails appels / Motif"] || "", isNight: r["Nuit"] === "__YES__", pageUrl: r.url || "" };
       });
     } else {
       rows.forEach(r => {
-        const date = r["date:Date:start"] || ""; if (!date) return;
+        const date = r["date:Date:start"]; if (!date) return;
         if (!s.entries[date]) s.entries[date] = { tranches: [] };
-        s.entries[date].tranches.push({ comment: r["Détails appels / Motif"]||"", pageUrl: r.url||"" });
+        s.entries[date].tranches.push({ comment: r["Détails appels / Motif"] || "", pageUrl: r.url || "" });
       });
     }
-    loadedMonths.add(key); // marquer comme chargé
+    loadedMonths.add(key);
   } catch(e) { showToast("Erreur chargement : " + e.message, "error"); }
 
   s.loading = false; renderCal(type);
+}
+
+function formatUUID(id) {
+  if (!id || id.includes("-")) return id;
+  return `${id.slice(0,8)}-${id.slice(8,12)}-${id.slice(12,16)}-${id.slice(16,20)}-${id.slice(20)}`;
 }
 
 // ── MODALES ──
@@ -1003,7 +1010,7 @@ function deleteHs() {
   if (!entry || !entry.pageUrl) return;
   if (!confirm("Supprimer cette saisie déjà envoyée ?")) return;
   const btn = document.getElementById("hs-del-btn"); btn.disabled = true; btn.textContent = "…";
-  mcp.callTool(NOTION, "notion-update-page", { page_id: entry.pageUrl, archived: true })
+  notionAPI("update", { pageId: entry.pageUrl, archived: true })
     .then(() => {
       showToast("Supprimé.", "success");
       document.getElementById("modal-hs").classList.remove("open");
@@ -1114,7 +1121,7 @@ async function deleteTranche_saved(idx) {
   const entry = calState.pq.entries[pqModalDate];
   if (!entry || !entry.tranches[idx]?.pageUrl) return;
   try {
-    await mcp.callTool(NOTION, "notion-update-page", { page_id: entry.tranches[idx].pageUrl, archived: true });
+    await notionAPI("update", { pageId: entry.tranches[idx].pageUrl, archived: true });
     showToast("Supprimé.", "success");
     invalidateCache("pq", calState.pq.year, calState.pq.month);
     await loadEntries_("pq");
@@ -1135,7 +1142,6 @@ function closeModal(type, e) {
 
 // ── SOUMETTRE TOUT ──
 async function submitAll() {
-  // Vérifier qu'aucune date du panier n'est dans un mois passé
   const now = new Date(); const cy = now.getFullYear(), cm = now.getMonth();
   const hasOldDate = [...Object.keys(basket.hs), ...basket.pq.flatMap(e => e.dates)]
     .some(d => { const [y, mo] = d.split("-").map(Number); return y < cy || (y === cy && mo - 1 < cm); });
@@ -1145,52 +1151,34 @@ async function submitAll() {
   const btn = document.getElementById("submit-btn");
   btn.disabled = true; btn.innerHTML = '<div class="spinner"></div><span>Envoi…</span>';
 
-  // S'assurer que mcp est disponible
-  if (!mcp) {
-    try { mcp = await claude.use("mcp"); } catch(e) {
-      showToast("Connexion Notion indisponible.", "error");
-      btn.disabled = false; btn.innerHTML = "<span>Soumettre tout</span>";
-      return;
-    }
-  }
-
-  let ok = true;
   try {
     // ── HS ──
     const hsEntries = Object.entries(basket.hs);
     if (hsEntries.length) {
-      const pages = hsEntries.map(([date, e]) => {
+      // Nouvelles créations
+      const newPages = hsEntries.filter(([, e]) => !e.pageUrl).map(([date, e]) => {
         const d = new Date(date + "T12:00:00");
         const moisNom = MONTHS[d.getMonth()]; const annee = d.getFullYear();
         const dayN = parseInt(date.split("-")[2]);
-        if (e.pageUrl) {
-          // Mise à jour - on fera les updates séparément
-          return null;
-        }
-        return { properties: {
+        return {
           "Titre": `${selectedCollab.name} - Heures sup - ${dayN}/${moisNom.slice(0,3)} ${annee}`,
-          "Collaborateur": selectedCollab._pageUrl, "Type": "Heures supplémentaires",
-          "date:Date:start": date, "date:Date:is_datetime": 0,
-          "Mois": moisNom, "Année": annee, "Statut": "Ouverte",
+          "Collaborateur": selectedCollab._pageUrl,
+          "Type": "Heures supplémentaires",
+          "Date": date, "Mois": moisNom, "Année": annee, "Statut": "Ouverte",
           "Détails appels / Motif": e.comment, "Nb heures sup": e.hours,
           "Nuit": e.isNight ? "__YES__" : "__NO__"
-        }};
-      }).filter(Boolean);
+        };
+      });
+      if (newPages.length) await notionAPI("create", { pages: newPages });
 
-      // Créations
-      if (pages.length) {
-        for (let i = 0; i < pages.length; i += 50)
-          await mcp.callTool(NOTION, "notion-create-pages", { allow_async: false, parent: { data_source_id: DS }, pages: pages.slice(i, i + 50) });
-      }
-
-      // Mises à jour (saisies déjà en Notion)
-      for (const [date, e] of hsEntries) {
+      // Mises à jour
+      for (const [, e] of hsEntries) {
         if (!e.pageUrl) continue;
-        await mcp.callTool(NOTION, "notion-update-page", { page_id: e.pageUrl, properties: {
-          "Nb heures sup": e.hours, "Détails appels / Motif": e.comment, "Nuit": e.isNight ? "__YES__" : "__NO__"
+        await notionAPI("update", { pageId: e.pageUrl, properties: {
+          "Nb heures sup": e.hours, "Détails appels / Motif": e.comment,
+          "Nuit": e.isNight ? "__YES__" : "__NO__"
         }});
       }
-
       invalidateCache("hs", calState.hs.year, calState.hs.month);
     }
 
@@ -1203,29 +1191,25 @@ async function submitAll() {
           const moisNom = MONTHS[d.getMonth()]; const annee = d.getFullYear();
           const dayN = parseInt(date.split("-")[2]);
           const nb = ((calState.pq.entries[date] || {}).tranches || []).length + 1;
-          allPages.push({ properties: {
+          allPages.push({
             "Titre": `${selectedCollab.name} - Piquet ${nb} - ${dayN}/${moisNom.slice(0,3)} ${annee}`,
-            "Collaborateur": selectedCollab._pageUrl, "Type": "Piquet",
-            "date:Date:start": date, "date:Date:is_datetime": 0,
-            "Mois": moisNom, "Année": annee, "Statut": "Ouverte",
+            "Collaborateur": selectedCollab._pageUrl,
+            "Type": "Piquet",
+            "Date": date, "Mois": moisNom, "Année": annee, "Statut": "Ouverte",
             "Détails appels / Motif": entry.comment
-          }});
+          });
         });
       });
-      for (let i = 0; i < allPages.length; i += 50)
-        await mcp.callTool(NOTION, "notion-create-pages", { allow_async: false, parent: { data_source_id: DS }, pages: allPages.slice(i, i + 50) });
-
+      if (allPages.length) await notionAPI("create", { pages: allPages });
       invalidateCache("pq", calState.pq.year, calState.pq.month);
     }
 
-    // Vider le panier + rafraîchir
     basket.hs = {}; basket.pq = [];
     updateBasketUI();
     showToast("Tout envoyé dans Notion ✓", "success");
     await Promise.all([loadEntries_("hs"), loadEntries_("pq")]);
 
   } catch(e) {
-    ok = false;
     showToast("Erreur lors de l'envoi : " + (e.message || ""), "error");
   } finally {
     btn.disabled = false; btn.innerHTML = "<span>Soumettre tout</span>";
